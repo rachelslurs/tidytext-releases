@@ -1,0 +1,291 @@
+name: Release (TidyText Offline)
+
+# Canonical release pipeline for TidyText Offline.
+#
+# This repo is PUBLIC and exists to serve releases (the updater's latest.json + the .dmg) to
+# anonymous clients. The app SOURCE lives in a separate PRIVATE repo — its full path is the
+# SOURCE_REPO secret, so it is NOT named in this world-readable file — and is checked out here at
+# the release tag via a read-only PAT. We build, sign (Apple Developer ID),
+# notarize, and publish the GitHub Release to THIS repo on free public-repo macOS minutes.
+#
+# Treat this job as HOSTILE-UNTIL-HARDENED — the Apple cert and the Tauri updater signing key are
+# present on a world-readable surface. Controls (see also the repo settings, which are not in code):
+#   • All signing material lives in the protected `release` Environment (env secrets, required
+#     reviewer, v* tag deployment rule). A run PAUSES at the env gate until Rachel approves.
+#   • Triggers are tag-push / manual dispatch ONLY — no pull_request (a fork PR can't see secrets
+#     and can't reach this job).
+#   • Top-level permissions are read-only; only this job elevates to contents: write.
+#   • Every action is pinned to a full commit SHA.
+#   • step-security/harden-runner runs first to lock egress (audit on the first release, then block).
+#   • CODEOWNERS gates edits to this file behind required review.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 0.1.3) — workflow_dispatch ALWAYS publishes as a prerelease'
+        required: true
+
+# Dedupe on the ref, but never cancel mid-publish (a half-uploaded release leaves the updater
+# pointing at a broken latest.json).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege: read by default. The single release job elevates to contents: write to publish.
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ONE job: checkout → build → sign → notarize → publish. The read PAT and the signing keys are
+  # `release` ENVIRONMENT secrets, readable only by a job that declares `environment: release`, so
+  # the whole chain runs behind a single approval. (Splitting into an ungated build job + a gated
+  # publish job would put the private-source checkout in front of the gate.)
+  release:
+    runs-on: macos-latest
+    timeout-minutes: 60 # fail a hung notarization instead of burning the default
+    environment: release
+    permissions:
+      contents: write # the job's GITHUB_TOKEN publishes the release to THIS public repo
+    steps:
+      # 1) Lock egress FIRST, before any other code runs. harden-runner supports macOS as of the
+      #    Feb-2026 release; v2.19.4 is past the DNS-over-TCP/HTTPS bypass fixes (>=2.16.0).
+      #    FIRST RELEASE: egress-policy: audit to capture the true egress set (incl. ALL Apple
+      #    notarization hosts) from a full signed+notarized run. AFTER that capture, swap in the
+      #    block config below (lock the allowlist from the audit's recommended policy).
+      - name: Harden the runner (egress audit → flip to block after the first release)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+          # ---- BLOCK CONFIG — swap in after the first audited release ----------------------------
+          # egress-policy: block
+          # disable-telemetry: true   # egress ENFORCEMENT still works; keeps build metadata off the
+          #                           # step-security backend, so the backend need not be allowlisted.
+          # allowed-endpoints: >
+          #   github.com:443
+          #   api.github.com:443
+          #   codeload.github.com:443
+          #   objects.githubusercontent.com:443
+          #   uploads.github.com:443
+          #   registry.npmjs.org:443
+          #   crates.io:443
+          #   index.crates.io:443
+          #   static.crates.io:443
+          #   <Apple notarization + softwareupdate hosts from the audit, e.g. *.apple.com:443>
+          # ---------------------------------------------------------------------------------------
+
+      # 2) Guard: the SOURCE tag must exist in the private repo BEFORE we trust the checkout.
+      #    (release.mjs pushes the source tag and confirms it before pushing this repo's trigger tag,
+      #    but assert here too so a hand-pushed trigger tag can't build a phantom ref.)
+      - name: Resolve source tag
+        id: srctag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="v${INPUT_VERSION}"
+          else
+            TAG="$REF_NAME"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Source tag: $TAG"
+
+      - name: Guard — source tag exists in the private repo
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_CHECKOUT_TOKEN }}
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }} # private source repo path — kept out of this public file
+          TAG: ${{ steps.srctag.outputs.tag }}
+        run: |
+          gh api "repos/${SOURCE_REPO}/git/ref/tags/${TAG}" --jq '.object.sha' \
+            || { echo "::error::source tag ${TAG} not found in the source repo — push the source tag (and confirm it) before the trigger tag"; exit 1; }
+
+      # 3) Check out the PRIVATE source at the exact tag. persist-credentials: false so the read PAT
+      #    is not left in git config for later steps.
+      - name: Check out private source at the release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ref: ${{ steps.srctag.outputs.tag }}
+          token: ${{ secrets.SOURCE_CHECKOUT_TOKEN }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ pin time
+        with:
+          toolchain: stable
+          # universal-apple-darwin is lipo'd from both arch builds, so install both
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: 'src-tauri -> target'
+          cache-on-failure: true
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build frontend (TAURI=1)
+        run: npx cross-env TAURI=1 npm run build
+
+      - name: Verify offline bundle guards (release)
+        run: npm run check:tauri-bundle -- --release --outDir dist
+
+      # Belt-and-suspenders: the build we are about to SIGN must point its updater at THIS public
+      # repo. Catches a stale tauri.conf.json endpoint before a signed build bakes in a dead URL.
+      - name: Assert updater endpoint is pinned to the public releases repo
+        run: npm run check:updater-endpoint
+
+      # Backstops the zero-network guarantee: frontendDist points at the dist we just built TAURI=1,
+      # and beforeBuildCommand reuses it. If either drifts, a build could bundle telemetry while the
+      # dist-grep guards stay green.
+      - name: Assert offline build wiring is intact
+        run: |
+          node -e '
+            const c = require("./src-tauri/tauri.conf.json");
+            if (c.build.beforeBuildCommand !== "node scripts/build-for-tauri.cjs") {
+              console.error("::error::beforeBuildCommand changed — the TAURI=1 frontend guarantee is at risk");
+              process.exit(1);
+            }
+            if (c.build.frontendDist !== "../dist") {
+              console.error("::error::frontendDist no longer points at the built dist");
+              process.exit(1);
+            }
+          '
+
+      # FAIL-CLOSED prerelease gate + version patch. Pure, unit-tested function (see the source repo's
+      # src/__tests__/resolveReleaseChannel.test.ts). Reads github.ref — on a tag push that is THIS
+      # repo's tag (same shape as before), so the gate is unchanged.
+      - name: Resolve version + release channel
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          GIT_REF: ${{ github.ref }}
+        run: node scripts/resolve-release-channel.mjs
+
+      - name: Decode App Store Connect API key
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }} # Key ID — used only to name the file
+        run: |
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_BASE64" | openssl base64 -d -A > "$KEY_PATH"
+          test -s "$KEY_PATH" || { echo "::error::decoded .p8 is empty — check the APPLE_API_KEY_BASE64 secret"; exit 1; }
+          grep -q 'BEGIN PRIVATE KEY' "$KEY_PATH" || { echo "::error::decoded .p8 is not a PEM key"; exit 1; }
+          echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Build and release
+        # Pinned (not @v0): this step mints signed updater manifests — a floating tag could change
+        # latest.json/signing behavior between runs. Bump deliberately. Publishes to THIS repo (the
+        # default), so no owner/repo override is needed.
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # publishes the release to THIS public repo
+          # Updater (minisign) signature
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Apple Developer ID code signing (tauri-action imports the cert into a temp keychain)
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # Notarization via App Store Connect API key (all stored as `release` env secrets)
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }} # Key ID
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }} # Issuer UUID
+          # APPLE_API_KEY_PATH is exported by the "Decode App Store Connect API key" step
+        with:
+          tagName: v__VERSION__
+          releaseName: 'TidyText Offline v__VERSION__'
+          releaseBody: 'See the assets to download and install this version.'
+          releaseDraft: false
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          includeUpdaterJson: true
+          args: --target universal-apple-darwin
+
+      - name: Verify signature, notarization staple, and Gatekeeper
+        run: |
+          BUNDLE=src-tauri/target/universal-apple-darwin/release/bundle
+          APP=$(find "$BUNDLE/macos" -maxdepth 1 -name '*.app' | head -1)
+          DMG=$(find "$BUNDLE/dmg" -maxdepth 1 -name '*.dmg' | head -1)
+          echo "Verifying app: $APP"
+          codesign --verify --deep --strict --verbose=2 "$APP" # hard gate (signing is deterministic)
+          spctl -a -vvv --type execute "$APP" # expect: accepted, source=Notarized Developer ID
+          # Staple checks warn-only until the dry-run proves action-v0.6.2 staples the .app (and .dmg).
+          xcrun stapler validate "$APP" || echo "::warning::app not stapled (promote to a hard gate once the dry-run confirms)"
+          xcrun stapler validate "$DMG" || echo "::warning::dmg not stapled (promote to a hard gate once the dry-run confirms)"
+
+      - name: Assert release flag + assets match the gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          GOT=$(gh release view "$TAG" --json isPrerelease -q .isPrerelease)
+          [ "$GOT" = "${{ steps.version.outputs.prerelease }}" ] \
+            || { echo "::error::release prerelease=$GOT but gate computed ${{ steps.version.outputs.prerelease }}"; exit 1; }
+          NAMES=$(gh release view "$TAG" --json assets -q '.assets[].name')
+          echo "$NAMES" | grep -qx 'latest.json' || { echo "::error::missing latest.json"; exit 1; }
+          echo "$NAMES" | grep -qE '\.dmg$' || { echo "::error::no .dmg attached"; exit 1; }
+          echo "$NAMES" | grep -qE '\.app\.tar\.gz$' || { echo "::error::no updater .tar.gz attached"; exit 1; }
+          echo "$NAMES" | grep -qE '\.app\.tar\.gz\.sig$' || { echo "::error::no updater .sig attached"; exit 1; }
+
+      # Give the human-download .dmg a stable, version-less name so the branded LS/Cloudflare redirect
+      # (/offline/download/mac → /releases/latest/download/<STABLE_DMG>) never needs editing on a bump.
+      # Renaming the .dmg does NOT touch the updater artifacts (.app.tar.gz / latest.json), so the
+      # updater's manifest↔asset coupling stays exactly as tauri-action minted it.
+      - name: Normalize the .dmg asset to a stable name
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ steps.version.outputs.version }}
+          STABLE_DMG: TidyText-Offline_universal.dmg
+        run: |
+          DMG_ID=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+            --jq '.assets[] | select(.name | endswith(".dmg")) | .id')
+          [ -n "$DMG_ID" ] || { echo "::error::no .dmg asset id found to rename"; exit 1; }
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/assets/${DMG_ID}" -f name="${STABLE_DMG}" >/dev/null
+          echo "renamed .dmg asset ${DMG_ID} → ${STABLE_DMG}"
+
+      # Phase 6a: prove every shipped asset is ANONYMOUSLY reachable (no Authorization header), so a
+      # release can never publish while the repo/assets are unreachable to real users. Asserts the
+      # TAG-specific URL (works for prereleases too — /releases/latest excludes prereleases by design).
+      - name: Assert published assets are anonymously reachable
+        env:
+          TAG: v${{ steps.version.outputs.version }}
+          STABLE_DMG: TidyText-Offline_universal.dmg
+        run: |
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          # Explicitly anonymous: this step sets NO GH_TOKEN, so curl sends no auth — the only way it
+          # 200s is if the asset is truly public (guards against the repo silently going private).
+          check() {
+            local url="$1" code
+            for i in 1 2 3 4 5; do
+              code=$(curl -sSL -o /dev/null -w '%{http_code}' "$url") || code=000
+              if [ "$code" = 200 ]; then echo "  200  $url"; return 0; fi
+              echo "  ($code) retry $i: $url"; sleep 5
+            done
+            echo "::error::asset not anonymously reachable (last HTTP $code): $url"; return 1
+          }
+          check "${base}/latest.json"
+          check "${base}/${STABLE_DMG}"
+          manifest=$(curl -sSL "${base}/latest.json")
+          echo "$manifest" | jq -e '.platforms | length > 0' >/dev/null \
+            || { echo "::error::latest.json has no platforms"; exit 1; }
+          echo "$manifest" | jq -r '.platforms[].url' | grep -q 'tidytext-releases' \
+            || { echo "::error::latest.json platform url is not on the public releases repo"; exit 1; }
+          echo "$manifest" | jq -e '[.platforms[].signature | length > 0] | all' >/dev/null \
+            || { echo "::error::latest.json has an empty platform signature"; exit 1; }
+          # The signed updater archive that latest.json points at must itself be anon-reachable.
+          for u in $(echo "$manifest" | jq -r '.platforms[].url'); do check "$u"; done

@@ -1,0 +1,39 @@
+name: Release reachability (drift guard)
+
+# Weekly ANONYMOUS check that the latest release's assets are reachable to real users. Catches drift
+# that happens AFTER publish — the repo silently going private, or an asset being deleted. No secrets
+# and no checkout: it sends no Authorization header, so a 200 proves genuine public reachability.
+# (Only meaningful once a full, non-prerelease v1.0.0 exists — /releases/latest excludes prereleases.)
+
+on:
+  schedule:
+    - cron: '17 14 * * 1' # Mondays ~14:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reachable:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert latest release assets are anonymously reachable
+        env:
+          STABLE_DMG: TidyText-Offline_universal.dmg
+        run: |
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download"
+          check() {
+            local url="$1" code
+            for i in 1 2 3; do
+              code=$(curl -sSL -o /dev/null -w '%{http_code}' "$url") || code=000
+              if [ "$code" = 200 ]; then echo "  200  $url"; return 0; fi
+              echo "  ($code) retry $i: $url"; sleep 10
+            done
+            echo "::error::latest release asset not anonymously reachable (last HTTP $code): $url"
+            return 1
+          }
+          check "${base}/latest.json"
+          check "${base}/${STABLE_DMG}"
+          # Sanity: the manifest must still point at THIS public repo (catches a bad repoint too).
+          curl -sSL "${base}/latest.json" | jq -r '.platforms[].url' | grep -q 'tidytext-releases' \
+            || { echo "::error::latest.json no longer points at the public releases repo"; exit 1; }
