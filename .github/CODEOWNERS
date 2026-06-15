@@ -1,0 +1,4 @@
+# This public repo serves signed releases + the updater manifest. The release workflow handles the
+# Apple cert and the Tauri updater signing key, so every change here must pass through review.
+# Pair this with a branch-protection rule that requires CODEOWNERS review (see the repo settings).
+* @rachelslurs
