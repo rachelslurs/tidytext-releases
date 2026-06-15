@@ -1,0 +1,26 @@
+name: Workflow guards
+
+# Structural hardening gate for the release pipeline — PURE TEXT PARSE, no secrets — so it is safe
+# to run on every PR and can be wired as a REQUIRED status check in the branch ruleset. It verifies
+# the release workflow STAYS hardened (SHA-pinned actions, the `release` env gate, no pull_request
+# trigger, read-only default permissions, harden-runner first, and no private-repo name leaking in).
+# It does NOT verify secret/PAT access — that requires the gated `release` environment, which is what
+# the on-demand "Release preflight (config doctor)" workflow checks. No path filter: it runs on every
+# PR so a required status check always reports (a path-filtered required check can hang as pending).
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-workflow-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Validate release-pipeline hardening
+        run: bash .github/scripts/check-release-workflow.sh
