@@ -1,9 +1,18 @@
 name: Release reachability (drift guard)
 
-# Weekly ANONYMOUS check that the latest release's assets are reachable to real users. Catches drift
-# that happens AFTER publish — the repo silently going private, or an asset being deleted. No secrets
-# and no checkout: it sends no Authorization header, so a 200 proves genuine public reachability.
-# (Only meaningful once a full, non-prerelease v1.0.0 exists — /releases/latest excludes prereleases.)
+# Weekly check that the latest PUBLISHED release stays reachable to real users — catching drift that
+# happens AFTER publish: the repo silently going private, or an asset being deleted/renamed. The
+# reachability ASSERTIONS are anonymous (no Authorization header), so a 200 proves genuine public
+# reachability.
+#
+# Skip-green guard: /releases/latest 404s anonymously BOTH when no Latest exists yet (the normal
+# pre-launch state) AND when a published repo silently goes private — so a bare anonymous 404 can't
+# tell "nothing to protect yet" from "the regression this guard exists to catch." To disambiguate, an
+# AUTHENTICATED existence probe (read-only repo token, used ONLY for this decision — never as a
+# reachability proof) asks whether a Latest release exists. A DEFINITIVE 404 → genuinely pre-launch →
+# skip green; 200 → assert anonymously (a 404 there is then a REAL regression); anything else (network
+# blip, rate limit, 5xx) → retry, then FAIL LOUD — never skip on an indeterminate probe, or the
+# masking hole reopens through the back door.
 
 on:
   schedule:
@@ -17,11 +26,54 @@ jobs:
   reachable:
     runs-on: ubuntu-latest
     steps:
+      # Lock egress first. This workflow runs no third-party code (no checkout/install), but the
+      # authenticated existence probe hits api.github.com — an endpoint the anonymous-only checks
+      # never touched — so the allowlist is pinned to exactly the hosts the curls below reach.
+      # release-assets.githubusercontent.com is GitHub's release-asset CDN (the /releases/.../download
+      # 302 target, verified live). The branded follow (curl -L) traverses ALL hops: tidytext.cc →
+      # github.com → release-assets.githubusercontent.com, so all three must stay allowed — every
+      # hop's host must be permitted, not just the entry host tidytext.cc.
+      - name: Harden the runner (egress block)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          disable-telemetry: true
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            release-assets.githubusercontent.com:443
+            tidytext.cc:443
+
       - name: Assert latest release assets are anonymously reachable
         env:
+          GH_TOKEN: ${{ github.token }}
           STABLE_DMG: TidyText-Offline_universal.dmg
         run: |
           base="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download"
+
+          # Existence probe (authenticated, read-only token; same endpoint semantics as the public
+          # /releases/latest URL = the latest NON-draft, NON-prerelease release). Used ONLY to decide
+          # whether there is something to assert — NEVER as a reachability proof (those stay anonymous).
+          #   404 (definitive) → no Latest yet → skip green (no false alarm during the pre-launch window)
+          #   200              → a release exists → assert anonymously below (a 404 there is then REAL)
+          #   anything else    → INDETERMINATE → retry, then FAIL LOUD (never skip — that re-masks drift)
+          probe="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest"
+          pcode=000
+          for i in 1 2 3; do
+            pcode=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$probe") || pcode=000
+            case "$pcode" in 200 | 404) break ;; esac
+            echo "  existence probe ($pcode) retry $i"; sleep 10
+          done
+          case "$pcode" in
+            404) echo "No published Latest release yet (authenticated 404) — nothing to protect; skipping green."; exit 0 ;;
+            200) echo "Latest release exists — asserting anonymous reachability." ;;
+            *)   echo "::error::release existence probe indeterminate (last HTTP $pcode) — refusing to skip; failing loud"; exit 1 ;;
+          esac
+
           check() {
             local url="$1" code
             for i in 1 2 3; do
@@ -37,3 +89,24 @@ jobs:
           # Sanity: the manifest must still point at THIS public repo (catches a bad repoint too).
           curl -sSL "${base}/latest.json" | jq -r '.platforms[].url' | grep -q 'tidytext-releases' \
             || { echo "::error::latest.json no longer points at the public releases repo"; exit 1; }
+
+          # Branded path: prove https://tidytext.cc/offline/download/mac (what the customer and the
+          # Lemon Squeezy product field hit) still resolves through the Cloudflare redirect to the
+          # stable-named .dmg. Catches _redirects / rename-target drift the raw GitHub-URL checks
+          # above can't see (they hit the asset URL directly, bypassing the branded redirect).
+          branded="https://tidytext.cc/offline/download/mac"
+          # First-hop (Cloudflare 302) target = what the LS field points at — catches redirect drift.
+          loc=$(curl -sSI "$branded" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}')
+          case "$loc" in
+            *"/${STABLE_DMG}") echo "  redirect target OK: $loc" ;;
+            *) echo "::error::branded redirect target is not …/${STABLE_DMG} (Location: ${loc:-none}) — _redirects or rename drift"; exit 1 ;;
+          esac
+          # Full follow (ranged GET, accept 200/206) — proves the asset is actually downloadable.
+          for i in 1 2 3 4 5; do
+            read -r bcode eff < <(curl -sSL -r 0-0 -o /dev/null -w '%{http_code} %{url_effective}' "$branded" || echo "000 -")
+            case "$bcode" in 200 | 206) break ;; esac
+            echo "  ($bcode) retry $i: $branded"; sleep 5
+          done
+          case "$bcode" in 200 | 206) : ;; *) echo "::error::branded URL not reachable (last HTTP $bcode): $branded"; exit 1 ;; esac
+          case "${eff%%\?*}" in *.dmg) : ;; *) echo "::error::branded URL resolved to a non-.dmg artifact: $eff"; exit 1 ;; esac
+          echo "✓ ${branded} → ${loc} → ${bcode} (.dmg)"
