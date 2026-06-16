@@ -57,7 +57,12 @@ jobs:
       # 1) Lock egress FIRST, before any other code runs. harden-runner supports macOS as of the
       #    Feb-2026 release; v2.19.4 is past the DNS-over-TCP/HTTPS bypass fixes (>=2.16.0).
       #    BLOCK mode: allowlist locked from the audited v0.9.1-rc.1 + v0.9.2-rc.1 runs (the
-      #    step-security recommended egress policy). `disable-telemetry: true` keeps build metadata
+      #    step-security recommended egress policy), plus tidytext.cc:443 for the branded-download
+      #    check — that check is gated to full releases, so the prerelease audit never exercised it.
+      #    The branded follow (curl -L) traverses ALL hops: tidytext.cc → github.com →
+      #    release-assets.githubusercontent.com (verified live), so all three hosts must stay allowed
+      #    — don't trim to just the entry host. github.com + release-assets were already here for the
+      #    raw checks. `disable-telemetry: true` keeps build metadata
       #    off the SS backend while egress ENFORCEMENT still works, so that backend need not be
       #    allowlisted. If a future toolchain/CDN bump needs a new host, the build fails LOUDLY
       #    naming the blocked endpoint — add it here (it's just hostnames, no secret).
@@ -92,6 +97,7 @@ jobs:
             static.crates.io:443
             static.rust-lang.org:443
             storage.googleapis.com:443
+            tidytext.cc:443
             timestamp.apple.com:80
             updates.cdn-apple.com:443
             uploads.github.com:443
@@ -295,9 +301,9 @@ jobs:
           echo "Verifying app: $APP"
           codesign --verify --deep --strict --verbose=2 "$APP" # hard gate (signing is deterministic)
           spctl -a -vvv --type execute "$APP" # expect: accepted, source=Notarized Developer ID
-          # Staple checks warn-only until the dry-run proves action-v0.6.2 staples the .app (and .dmg).
-          xcrun stapler validate "$APP" || echo "::warning::app not stapled (promote to a hard gate once the dry-run confirms)"
-          xcrun stapler validate "$DMG" || echo "::warning::dmg not stapled (promote to a hard gate once the dry-run confirms)"
+          # The v9.9.9 dry-run confirmed action-v0.6.2 staples the .app → hard gate it. tauri-action
+          # does NOT staple the .dmg, so it's stapled + re-uploaded in the "Staple the .dmg" step below.
+          xcrun stapler validate "$APP" # hard gate — the .app must be stapled
 
       - name: Assert release flag + assets match the gate
         env:
@@ -332,6 +338,24 @@ jobs:
           gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/assets/${DMG_ID}" -f name="${STABLE_DMG}" >/dev/null
           echo "renamed .dmg asset ${DMG_ID} → ${STABLE_DMG}"
 
+      # tauri-action notarizes the .dmg but does NOT staple it, so its first open would hit Apple's
+      # servers (Gatekeeper online-check) — unacceptable for an offline product. Staple the local
+      # (notarized) .dmg and re-upload it under the stable name, replacing the unstapled asset. Runs
+      # AFTER the rename and BEFORE the reachability check so the served asset is the final stapled one.
+      - name: Staple the .dmg and replace the published asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ steps.version.outputs.version }}
+          STABLE_DMG: TidyText-Offline_universal.dmg
+        run: |
+          DMG=$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -1)
+          [ -n "$DMG" ] || { echo "::error::no local .dmg found to staple"; exit 1; }
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG" # hard gate — must be stapled now
+          cp "$DMG" "${RUNNER_TEMP}/${STABLE_DMG}"
+          gh release upload "$TAG" "${RUNNER_TEMP}/${STABLE_DMG}" --clobber -R "$GITHUB_REPOSITORY"
+          echo "stapled + re-uploaded ${STABLE_DMG}"
+
       # Phase 6a: prove every shipped asset is ANONYMOUSLY reachable (no Authorization header), so a
       # release can never publish while the repo/assets are unreachable to real users. Asserts the
       # TAG-specific URL (works for prereleases too — /releases/latest excludes prereleases by design).
@@ -363,3 +387,28 @@ jobs:
             || { echo "::error::latest.json has an empty platform signature"; exit 1; }
           # The signed updater archive that latest.json points at must itself be anon-reachable.
           for u in $(echo "$manifest" | jq -r '.platforms[].url'); do check "$u"; done
+
+      # Phase 6a (branded): for a FULL release only (Latest exists), prove the customer-facing
+      # tidytext.cc/offline/download/mac path resolves end-to-end through the Cloudflare redirect to
+      # the stable-named .dmg. Catches _redirects / rename-target drift the raw checks above can't see.
+      - name: Assert the branded download URL resolves (full release only)
+        if: ${{ steps.version.outputs.prerelease == 'false' }}
+        env:
+          STABLE_DMG: TidyText-Offline_universal.dmg
+        run: |
+          branded="https://tidytext.cc/offline/download/mac"
+          # First-hop (Cloudflare 302) target = what the LS field points at — catches redirect drift.
+          loc=$(curl -sSI "$branded" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}')
+          case "$loc" in
+            *"/${STABLE_DMG}") echo "  redirect target OK: $loc" ;;
+            *) echo "::error::branded redirect target is not …/${STABLE_DMG} (Location: ${loc:-none}) — _redirects or rename drift"; exit 1 ;;
+          esac
+          # Full follow (ranged GET, accept 200/206) — proves the asset is actually downloadable.
+          for i in 1 2 3 4 5; do
+            read -r bcode eff < <(curl -sSL -r 0-0 -o /dev/null -w '%{http_code} %{url_effective}' "$branded" || echo "000 -")
+            case "$bcode" in 200 | 206) break ;; esac
+            echo "  ($bcode) retry $i: $branded"; sleep 5
+          done
+          case "$bcode" in 200 | 206) : ;; *) echo "::error::branded URL not reachable (last HTTP $bcode): $branded"; exit 1 ;; esac
+          case "${eff%%\?*}" in *.dmg) : ;; *) echo "::error::branded URL resolved to a non-.dmg artifact: $eff"; exit 1 ;; esac
+          echo "✓ ${branded} → ${loc} → ${bcode} (.dmg)"
