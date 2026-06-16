@@ -25,9 +25,13 @@ for wf in "${WORKFLOWS[@]}"; do
   fi
 done
 
-# 2. No workflow names the private source repo — it must be reached via the SOURCE_REPO secret.
-if grep -nE 'tidytext\.cc' "${WORKFLOWS[@]}"; then
-  fail "a workflow above names the private repo literally — use the SOURCE_REPO secret instead"
+# 2. No workflow names the private SOURCE repo (rachelslurs/tidytext.cc) literally — it must be
+#    reached via the SOURCE_REPO secret. The bare web domain tidytext.cc IS allowed: the branded
+#    download URL https://tidytext.cc/offline/download/mac is an intentional public reference. So
+#    match only the OWNER-QUALIFIED private-repo path, never the public domain or the public
+#    rachelslurs/tidytext-releases repo (which has no `.cc`).
+if grep -nE 'rachelslurs/tidytext\.cc' "${WORKFLOWS[@]}"; then
+  fail "a workflow above names the private source repo literally — use the SOURCE_REPO secret instead"
 fi
 
 # 3. The release workflow has no pull_request trigger (a secret-bearing job must never run on a PR).
@@ -51,5 +55,16 @@ CO_LINE="$(grep -nE 'actions/checkout@' "$REL" | head -1 | cut -d: -f1)"
 [ -n "$HR_LINE" ] || fail "$REL must run step-security/harden-runner"
 { [ -n "$CO_LINE" ] && [ "$HR_LINE" -lt "$CO_LINE" ]; } \
   || fail "$REL must run harden-runner before actions/checkout"
+
+# 7. The stable .dmg asset name is pinned to exactly TidyText-Offline_universal.dmg everywhere it's
+#    defined. The branded download URL, the _redirects target over in tidytext.cc, and the Lemon
+#    Squeezy product field all hardcode this filename — a drift on any STABLE_DMG def silently 404s
+#    a paying customer. A legitimate rename is a deliberate, coordinated change across all of them.
+DMG_DEFS="$(grep -hoE 'STABLE_DMG:[[:space:]]*[^[:space:]]+' "$REL" | sed -E 's/^STABLE_DMG:[[:space:]]*//')"
+[ -n "$DMG_DEFS" ] || fail "$REL defines no STABLE_DMG (expected TidyText-Offline_universal.dmg)"
+while IFS= read -r name; do
+  [ "$name" = "TidyText-Offline_universal.dmg" ] \
+    || fail "$REL STABLE_DMG must be 'TidyText-Offline_universal.dmg' (got '$name')"
+done <<< "$DMG_DEFS"
 
 echo "✓ release pipeline structural hardening checks passed"
