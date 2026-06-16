@@ -428,12 +428,18 @@ jobs:
             *"/${STABLE_DMG}") echo "  redirect target OK: $loc" ;;
             *) echo "::error::branded redirect target is not …/${STABLE_DMG} (Location: ${loc:-none}) — _redirects or rename drift"; exit 1 ;;
           esac
-          # Full follow (ranged GET, accept 200/206) — proves the asset is actually downloadable.
+          # Full follow (ranged GET, accept 200/206) proves the asset is downloadable. Assert the HTTP
+          # code, NOT the URL suffix: the final hop is GitHub's signed CDN
+          # (release-assets.githubusercontent.com/<uuid>?…) whose path is a UUID and whose .dmg name
+          # lives only in the query string. Use $(curl -w) not `read < <(curl -w …)`: curl's -w has no
+          # trailing newline, so read returns non-zero and `bash -e` would kill the step on a SUCCESS.
+          bcode=000
           for i in 1 2 3 4 5; do
-            read -r bcode eff < <(curl -sSL -r 0-0 -o /dev/null -w '%{http_code} %{url_effective}' "$branded" || echo "000 -")
+            bcode=$(curl -sSL -r 0-0 -o /dev/null -w '%{http_code}' "$branded" || echo 000)
             case "$bcode" in 200 | 206) break ;; esac
             echo "  ($bcode) retry $i: $branded"; sleep 5
           done
-          case "$bcode" in 200 | 206) : ;; *) echo "::error::branded URL not reachable (last HTTP $bcode): $branded"; exit 1 ;; esac
-          case "${eff%%\?*}" in *.dmg) : ;; *) echo "::error::branded URL resolved to a non-.dmg artifact: $eff"; exit 1 ;; esac
-          echo "✓ ${branded} → ${loc} → ${bcode} (.dmg)"
+          case "$bcode" in
+            200 | 206) echo "✓ ${branded} → ${loc} → ${bcode}" ;;
+            *) echo "::error::branded URL not reachable (last HTTP $bcode): $branded"; exit 1 ;;
+          esac
