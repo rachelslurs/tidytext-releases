@@ -2,16 +2,20 @@ name: Release preflight (config doctor)
 
 # On-demand check that the `release` environment is fully configured BEFORE you cut a real release.
 # It reads the release secrets, so it runs behind the SAME approval gate as a release — but it
-# builds NOTHING. It only verifies each required secret is present, that the read PAT can reach the
-# source repo, and that the Apple key/cert decode. NO secret value is ever printed. Run it after
-# rotating the PAT or changing any secret.
+# builds NOTHING. It verifies: each required secret is present, the read PAT can reach the source
+# repo, the Apple key/cert decode, AND the Tauri updater PRIVATE key matches the PUBLIC key
+# published in src-tauri/tauri.conf.json (so a shipped v1 can verify a v2 auto-update — a mismatch
+# would silently brick updates for every user). NO secret value is ever printed. Run it after
+# rotating the PAT, rotating the updater signing key, or changing any secret.
 #
 # Why not on push? These are ENVIRONMENT secrets, readable only by a job that declares
 # `environment: release` — which triggers the approval gate. So a silent per-push secret check
 # isn't possible; this is the deliberate, gated, on-demand equivalent.
 #
-# The validation below is intentionally identical to the "Preflight" step in release.yml — keep
-# the two in sync.
+# The "Validate release configuration" step is kept intentionally identical to the "Preflight" step
+# in release.yml — keep those two in sync. The updater-keypair step is doctor-only (release.yml
+# already asserts the updater wiring against the source it checks out); mirror it there too if you
+# want the keypair asserted before the ~30-min build.
 
 on:
   workflow_dispatch:
@@ -65,3 +69,47 @@ jobs:
             echo "All \`release\` environment secrets are present, the read PAT can reach the source"
             echo "repo, and the Apple key/cert decode. Safe to cut a release."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Verify the updater keypair: the PRIVATE key in this `release` env must match the PUBLIC key
+      # the app actually ships. The pubkey is read from its SOURCE OF TRUTH — src-tauri/tauri.conf.json
+      # on the source repo's default branch — so there is no second copy of it to drift. A mismatch
+      # means a shipped v1 could never verify a v2 update (silent breakage for every user), so it
+      # FAILS the doctor. No secret value is printed; the private key only ever lands in a file on this
+      # ephemeral runner. The source repo is named solely via the SOURCE_REPO secret.
+      - name: Verify updater keypair (release signing key ↔ published pubkey)
+        env:
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          GH_TOKEN: ${{ secrets.SOURCE_CHECKOUT_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+
+          # Pull the published pubkey from the source of truth (base64 of a minisign public-key file).
+          PUBKEY_B64="$(gh api "repos/${SOURCE_REPO}/contents/src-tauri/tauri.conf.json" \
+            --jq '.content' | base64 -d | jq -r '.plugins.updater.pubkey')"
+          { [ -n "$PUBKEY_B64" ] && [ "$PUBKEY_B64" != "null" ]; } \
+            || { echo "::error::could not read plugins.updater.pubkey from src-tauri/tauri.conf.json in SOURCE_REPO"; exit 1; }
+
+          # Materialize the keypair files (Tauri stores both as base64 of the minisign key file).
+          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" | base64 -d > sk.key
+          printf '%s' "$PUBKEY_B64" | base64 -d > updater.pub
+
+          echo "updater keypair self-check" > probe.txt
+          # Sign with the secret (password via stdin — the runner has no tty), then verify the produced
+          # probe.txt.minisig against the published pubkey (verify needs no password).
+          printf '%s\n' "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" | minisign -S -s sk.key -m probe.txt
+          if minisign -V -p updater.pub -m probe.txt; then
+            KEYID="$(grep -oE '[0-9A-F]{16}' updater.pub | head -1)"
+            echo "✓ updater keypair OK — release signing key matches the published pubkey (key ID ${KEYID})"
+            {
+              echo "## ✓ Updater keypair verified"
+              echo ""
+              echo "The \`release\` signing key matches the updater public key published in"
+              echo "\`src-tauri/tauri.conf.json\` (key ID ${KEYID}); the auto-update trust chain is sound."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::updater keypair MISMATCH — TAURI_SIGNING_PRIVATE_KEY does not match the pubkey in tauri.conf.json; a shipped v1 could never verify a v2 auto-update"
+            exit 1
+          fi
