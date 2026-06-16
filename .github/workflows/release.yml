@@ -301,8 +301,9 @@ jobs:
           echo "Verifying app: $APP"
           codesign --verify --deep --strict --verbose=2 "$APP" # hard gate (signing is deterministic)
           spctl -a -vvv --type execute "$APP" # expect: accepted, source=Notarized Developer ID
-          # The v9.9.9 dry-run confirmed action-v0.6.2 staples the .app → hard gate it. tauri-action
-          # does NOT staple the .dmg, so it's stapled + re-uploaded in the "Staple the .dmg" step below.
+          # action-v0.6.2 staples the .app → hard gate it. tauri-action notarizes the .app but NOT the
+          # .dmg, so the .dmg is notarized + stapled + re-uploaded in the "Notarize + staple the .dmg"
+          # step below (you can't staple a ticket Apple never minted).
           xcrun stapler validate "$APP" # hard gate — the .app must be stapled
 
       - name: Assert release flag + assets match the gate
@@ -338,23 +339,47 @@ jobs:
           gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/assets/${DMG_ID}" -f name="${STABLE_DMG}" >/dev/null
           echo "renamed .dmg asset ${DMG_ID} → ${STABLE_DMG}"
 
-      # tauri-action notarizes the .dmg but does NOT staple it, so its first open would hit Apple's
-      # servers (Gatekeeper online-check) — unacceptable for an offline product. Staple the local
-      # (notarized) .dmg and re-upload it under the stable name, replacing the unstapled asset. Runs
-      # AFTER the rename and BEFORE the reachability check so the served asset is the final stapled one.
-      - name: Staple the .dmg and replace the published asset
+      # tauri-action notarizes the .app but NOT the .dmg, so the .dmg has no Apple ticket and its first
+      # open would hit Gatekeeper's online-check (or fail offline) — unacceptable for an offline product.
+      # NOTARIZE the .dmg, then staple, then re-upload it under the stable name, replacing the unstapled
+      # asset. Runs AFTER the rename and BEFORE the reachability check so the served asset is the final
+      # stapled one.
+      - name: Notarize + staple the .dmg and replace the published asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: v${{ steps.version.outputs.version }}
           STABLE_DMG: TidyText-Offline_universal.dmg
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }} # Key ID
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }} # Issuer UUID
+          # APPLE_API_KEY_PATH (the decoded .p8) is exported to $GITHUB_ENV by the "Decode …" step.
         run: |
           DMG=$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -1)
-          [ -n "$DMG" ] || { echo "::error::no local .dmg found to staple"; exit 1; }
+          [ -n "$DMG" ] || { echo "::error::no local .dmg found to notarize"; exit 1; }
+          echo "local dmg: $DMG"
+          # `notarytool submit --wait` exits 0 once the submission COMPLETES — including status Invalid.
+          # A rejected notarization is a finished submission, so we must assert .status == Accepted, not
+          # trust the exit code (else `stapler` below fails the same "Record not found" way, one round
+          # later). On anything but Accepted, dump the notary log (the REASON) and fail loud.
+          submit_json=$(xcrun notarytool submit "$DMG" \
+            --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+            --wait --output-format json)
+          echo "$submit_json"
+          sub_id=$(echo "$submit_json" | jq -r '.id // empty')
+          status=$(echo "$submit_json" | jq -r '.status // empty')
+          if [ "$status" != "Accepted" ]; then
+            echo "::error::dmg notarization not Accepted (status='${status:-none}') — notary log follows"
+            [ -n "$sub_id" ] && xcrun notarytool log "$sub_id" \
+              --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" || true
+            exit 1
+          fi
           xcrun stapler staple "$DMG"
-          xcrun stapler validate "$DMG" # hard gate — must be stapled now
+          xcrun stapler validate "$DMG" # hard gate — the served .dmg must be stapled
           cp "$DMG" "${RUNNER_TEMP}/${STABLE_DMG}"
+          # Prove the served copy is byte-identical to the stapled local dmg (not a stale leftover):
+          # the two SHA-256s below must match before the clobber-upload.
+          shasum -a 256 "$DMG" "${RUNNER_TEMP}/${STABLE_DMG}"
           gh release upload "$TAG" "${RUNNER_TEMP}/${STABLE_DMG}" --clobber -R "$GITHUB_REPOSITORY"
-          echo "stapled + re-uploaded ${STABLE_DMG}"
+          echo "notarized + stapled + re-uploaded ${STABLE_DMG}"
 
       # Phase 6a: prove every shipped asset is ANONYMOUSLY reachable (no Authorization header), so a
       # release can never publish while the repo/assets are unreachable to real users. Asserts the
