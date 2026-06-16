@@ -288,10 +288,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="v${{ steps.version.outputs.version }}"
-          GOT=$(gh release view "$TAG" --json isPrerelease -q .isPrerelease)
+          # -R is load-bearing: the source checkout owns the workspace, so a bare `gh release view`
+          # infers the PRIVATE source repo (which GITHUB_TOKEN can't read) instead of THIS releases
+          # repo. $GITHUB_REPOSITORY is this repo (rachelslurs/tidytext-releases).
+          GOT=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)
           [ "$GOT" = "${{ steps.version.outputs.prerelease }}" ] \
             || { echo "::error::release prerelease=$GOT but gate computed ${{ steps.version.outputs.prerelease }}"; exit 1; }
-          NAMES=$(gh release view "$TAG" --json assets -q '.assets[].name')
+          NAMES=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
           echo "$NAMES" | grep -qx 'latest.json' || { echo "::error::missing latest.json"; exit 1; }
           echo "$NAMES" | grep -qE '\.dmg$' || { echo "::error::no .dmg attached"; exit 1; }
           echo "$NAMES" | grep -qE '\.app\.tar\.gz$' || { echo "::error::no updater .tar.gz attached"; exit 1; }
