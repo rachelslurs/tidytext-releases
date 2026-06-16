@@ -152,6 +152,26 @@ jobs:
           token: ${{ secrets.SOURCE_CHECKOUT_TOKEN }}
           persist-credentials: false
 
+      # The keypair verifier lives in THIS repo; the source checkout above took the workspace root, so
+      # fetch just this repo's scripts dir alongside it (sparse, separate path, no creds left behind).
+      - name: Fetch the keypair verifier (this repo)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          path: .release-ci
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      # AUTHORITATIVE updater-keypair gate. Reads the pubkey from the tauri.conf.json THIS build just
+      # checked out at the tag — the exact bytes that compile and ship — so it is immune to the daylight
+      # a separate preflight leaves (preflighted a different/force-moved/skipped tag, or the no-version
+      # path). Runs BEFORE the ~30-min build+notarize so a mismatch fails cheap. Shares one logic with
+      # preflight.yml via the script; here the pubkey source is the working tree, not a gh api fetch.
+      - name: Verify updater keypair (signing key ↔ checked-out pubkey) — authoritative
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bash .release-ci/.github/scripts/verify-updater-keypair.sh --conf src-tauri/tauri.conf.json
+
       - name: Setup Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:

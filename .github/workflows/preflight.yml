@@ -20,10 +20,12 @@ name: Release preflight (config doctor)
 # isn't possible; this is the deliberate, gated, on-demand equivalent.
 #
 # The "Validate release configuration" step is kept intentionally identical to the "Preflight" step
-# in release.yml — keep those two in sync. The updater-keypair step is doctor-only; mirror it into
-# release.yml (against the source it already checks out at the tag) if you want it asserted before
-# the ~30-min build — that in-build check is the only one guaranteed to validate the same bytes that
-# ship, since this doctor is a separate manual run.
+# in release.yml — keep those two in sync. The updater-keypair check here is the FAIL-FAST doctor;
+# the AUTHORITATIVE gate is the in-build check in release.yml, which validates the exact
+# tauri.conf.json the build checked out at the tag (immune to preflighting a different/forced/skipped
+# tag, or the no-version path). Both call the shared .github/scripts/verify-updater-keypair.sh — one
+# logic, two pubkey sources (this doctor fetches via gh api at the ref; the build reads its working
+# tree).
 
 on:
   workflow_dispatch:
@@ -44,6 +46,13 @@ jobs:
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: audit
+
+      # This repo's own CI scripts (the shared keypair verifier). Sparse — just the scripts dir.
+      - name: Check out CI scripts (this repo)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
 
       - name: Validate release configuration
         env:
@@ -82,14 +91,14 @@ jobs:
             echo "repo, and the Apple key/cert decode. Safe to cut a release."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Verify the updater keypair: the PRIVATE key in this `release` env must match the PUBLIC key
-      # the app will SHIP. The pubkey is read AT THE RELEASE TAG — the exact ref release.yml checks
-      # out and embeds — not the default branch, so a rotation that landed on main after the tag (or
-      # a tag cut from an older commit) can't pass here while the build ships a different key. With no
-      # `version` input it falls back to the default branch and WARNS. A real mismatch FAILS the
-      # doctor. No secret value is printed; the private key only ever lands in a file on this
-      # ephemeral runner. The source repo is named solely via the SOURCE_REPO secret.
-      - name: Verify updater keypair (release signing key ↔ pubkey at the release tag)
+      # Fail-fast updater-keypair doctor: confirm the `release` signing key is the counterpart of the
+      # pubkey the app will SHIP, read AT THE RELEASE TAG (the ref release.yml checks out and embeds)
+      # — not the default branch, so a rotation that landed on main after the tag, or a tag cut from an
+      # older commit, can't pass here while the build ships a different key. With no `version` it falls
+      # back to the default branch and WARNS. The AUTHORITATIVE gate is release.yml's in-build check
+      # (it validates the exact checked-out bytes); this one just surfaces drift early, before build
+      # minutes. Sign+verify is shared via .github/scripts/verify-updater-keypair.sh.
+      - name: Verify updater keypair (signing key ↔ pubkey at the release tag)
         env:
           SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
           GH_TOKEN: ${{ secrets.SOURCE_CHECKOUT_TOKEN }}
@@ -98,49 +107,19 @@ jobs:
           VERSION: ${{ github.event.inputs.version }} # via env, never inlined in the script (injection-safe)
         run: |
           set -euo pipefail
-          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
-
-          # Pin the pubkey read to the SAME ref the build embeds: the release tag. release.yml checks
-          # out the source at v<version>, so a default-branch read could validate a DIFFERENT pubkey
-          # than ships. Require the source tag to actually exist before trusting it.
+          # Validate against the SAME ref the build embeds: the release tag if given, else the default
+          # branch (with a loud warning — the in-build check is the real gate in that case).
           if [ -n "${VERSION:-}" ]; then
-            REF="v${VERSION#v}" # tolerate a leading 'v' in the input
+            REF="v${VERSION#v}" # tolerate a leading 'v'
             gh api "repos/${SOURCE_REPO}/git/ref/tags/${REF}" --jq '.object.sha' >/dev/null 2>&1 \
               || { echo "::error::source tag ${REF} not found in SOURCE_REPO — push/confirm the source tag before validating the keypair"; exit 1; }
           else
             REF="$(gh api "repos/${SOURCE_REPO}" --jq '.default_branch')"
-            echo "::warning::no version provided — validating the keypair against the default branch (${REF}), NOT a release tag. Re-run with the release version before cutting to validate the exact config that will ship."
+            echo "::warning::no version provided — validating against the default branch (${REF}), NOT a release tag. release.yml's in-build check is the authoritative gate; re-run here with the version to fail fast on the exact tag."
           fi
-
-          # Pull the published pubkey AT THAT REF. (contents .content is base64 of the file; the
-          # pubkey field within is itself base64 of a minisign .pub.)
+          # Source the pubkey from tauri.conf.json AT THAT REF (contents .content is base64 of the file),
+          # then hand it to the shared verifier (preflight's pubkey source = gh api at the ref).
           PUBKEY_B64="$(gh api "repos/${SOURCE_REPO}/contents/src-tauri/tauri.conf.json?ref=${REF}" \
             --jq '.content' | base64 -d | jq -r '.plugins.updater.pubkey')"
-          { [ -n "$PUBKEY_B64" ] && [ "$PUBKEY_B64" != "null" ]; } \
-            || { echo "::error::could not read plugins.updater.pubkey from src-tauri/tauri.conf.json @ ${REF}"; exit 1; }
-
-          # Materialize the keypair files. TAURI_SIGNING_PRIVATE_KEY and the pubkey are each base64 of
-          # a minisign key file. We sign AND verify with minisign (tauri signer has no verify), keeping
-          # everything as plain minisign files — no tauri-.sig base64 layer to reconcile.
-          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" | base64 -d > sk.key
-          printf '%s' "$PUBKEY_B64" | base64 -d > updater.pub
-
-          echo "updater keypair self-check" > probe.txt
-          # Non-interactive: password on stdin (no tty on the runner). If minisign cannot LOAD sk.key
-          # (an rsign2/minisign format edge case — NOT a mismatch), sign with the tauri CLI instead:
-          #   tauri signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" probe.txt
-          #   base64 -d probe.txt.sig > probe.txt.minisig   # then: minisign -V -p updater.pub -m probe.txt -x probe.txt.minisig
-          printf '%s\n' "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" | minisign -S -s sk.key -m probe.txt
-          if minisign -V -p updater.pub -m probe.txt; then
-            KEYID="$(grep -oE '[0-9A-F]{16}' updater.pub | head -1)"
-            echo "✓ updater keypair OK @ ${REF} — release signing key matches the published pubkey (key ID ${KEYID})"
-            {
-              echo "## ✓ Updater keypair verified @ ${REF}"
-              echo ""
-              echo "The \`release\` signing key matches the updater public key in \`src-tauri/tauri.conf.json\`"
-              echo "at \`${REF}\` (key ID ${KEYID}); the auto-update trust chain is sound for this ref."
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "::error::updater keypair MISMATCH @ ${REF} — TAURI_SIGNING_PRIVATE_KEY does not match the pubkey in tauri.conf.json at this ref; a shipped build would have a dead v1->v2 auto-update"
-            exit 1
-          fi
+          echo "Validating updater keypair against ${REF}"
+          bash .github/scripts/verify-updater-keypair.sh --pubkey-b64 "$PUBKEY_B64"
