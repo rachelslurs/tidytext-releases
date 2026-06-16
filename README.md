@@ -33,9 +33,20 @@ Actions → **Release (TidyText Offline)** rebuilds from the source tag but **al
 
 ### First release
 
-1. Run **Release preflight (config doctor)** via `workflow_dispatch` and approve the `release` environment gate.
-2. Cut the release from the source repo; approve the `release` environment when the tag-push run pauses.
-3. After the first full audited release, flip `step-security/harden-runner` from `egress-policy: audit` to `block` with the captured allowlist (see comments in `.github/workflows/release.yml`).
+1. Run **Release preflight (config doctor)** via `workflow_dispatch` and approve the `release` environment gate. It validates every `release` secret, the read PAT's reach, the Apple key/cert, **and** the updater signing key (see [Updater signing key](#updater-signing-key)). Leave the `version` input blank to check against `main` (fail-fast); pass it only once the source tag exists, to validate that exact tag.
+2. Cut the release from the source repo; approve the `release` environment when the tag-push run pauses. The build re-verifies the updater keypair against the checked-out tag before building (authoritative).
+3. After the first full audited release, flip `step-security/harden-runner` from `egress-policy: audit` to `block` with the captured allowlist (see comments in `.github/workflows/release.yml`). The allowlist includes the keypair step's minisign/Homebrew egress — keep it.
+
+### Updater signing key
+
+The Tauri updater verifies each update against the minisign public key baked into the *installed* app, so the private key in the `release` environment (`TAURI_SIGNING_PRIVATE_KEY`) must always be the counterpart of the `pubkey` in the source repo's `src-tauri/tauri.conf.json`. A mismatch is silent: the build succeeds and v1 installs fine, but v1 can never verify a v2 update — every existing install would then need a manual reinstall. **Once a release ships, treat the keypair as permanent** (Tauri has no updater key rotation).
+
+Two checks guard this, sharing one script — `.github/scripts/verify-updater-keypair.sh`, which signs a throwaway probe with the private key and verifies it against the pubkey (no secret value is printed):
+
+- **In-build (authoritative)** — `release.yml`, right after the source checkout, validates against the `tauri.conf.json` it just checked out *at the release tag* (the exact bytes that ship), before the build. Immune to validating a different/force-moved/skipped tag.
+- **Preflight (fail-fast)** — the config doctor validates against the pubkey fetched from the source repo at the release tag (`version` input), or against `main` with a warning if no version is given. Surfaces drift during setup, before build minutes.
+
+Because preflight with a `version` requires that source tag to already exist, the typical pre-cut run leaves `version` blank (validates `main`); the in-build check is the real gate on the shipped tag. If `minisign -S` ever fails to *load* the key (an rsign2/minisign format edge case, not a mismatch), use the `tauri signer sign` → `base64 -d` → `minisign -V -x` fallback noted in the script.
 
 ### Reachability cron
 
