@@ -293,18 +293,21 @@ jobs:
           includeUpdaterJson: true
           args: --target universal-apple-darwin
 
-      - name: Verify signature, notarization staple, and Gatekeeper
+      - name: Verify the .app signature + notarization staple
         run: |
           BUNDLE=src-tauri/target/universal-apple-darwin/release/bundle
           APP=$(find "$BUNDLE/macos" -maxdepth 1 -name '*.app' | head -1)
-          DMG=$(find "$BUNDLE/dmg" -maxdepth 1 -name '*.dmg' | head -1)
+          [ -n "$APP" ] || { echo "::error::no .app found to verify"; exit 1; }
           echo "Verifying app: $APP"
           codesign --verify --deep --strict --verbose=2 "$APP" # hard gate (signing is deterministic)
-          spctl -a -vvv --type execute "$APP" # expect: accepted, source=Notarized Developer ID
-          # action-v0.6.2 staples the .app → hard gate it. tauri-action notarizes the .app but NOT the
-          # .dmg, so the .dmg is notarized + stapled + re-uploaded in the "Notarize + staple the .dmg"
-          # step below (you can't staple a ticket Apple never minted).
-          xcrun stapler validate "$APP" # hard gate — the .app must be stapled
+          # `stapler validate` is the AUTHORITATIVE, OFFLINE staple gate: it fails closed if tauri-action's
+          # native notarize-then-staple lost the ticket-propagation race and produced an unstapled .app
+          # (the 2026-06-20 flake). We intentionally DROP the prior `spctl` check: on the egress-blocked
+          # runner its online Gatekeeper lookup is itself a flake source (it's what failed 2026-06-20) and
+          # adds no signal beyond `stapler validate` — a stapled ticket implies notarization, codesign
+          # covers the signature. The artifact a user actually launches (the .app INSIDE the published
+          # .dmg) is validated on the shipped bytes in the "Notarize + staple the .dmg" step below.
+          xcrun stapler validate "$APP" # AUTHORITATIVE — the .app must carry a stapled ticket
 
       - name: Assert release flag + assets match the gate
         env:
@@ -373,13 +376,32 @@ jobs:
             exit 1
           fi
           xcrun stapler staple "$DMG"
-          xcrun stapler validate "$DMG" # hard gate — the served .dmg must be stapled
+          xcrun stapler validate "$DMG" # hard gate — the served .dmg CONTAINER must be stapled
           cp "$DMG" "${RUNNER_TEMP}/${STABLE_DMG}"
           # Prove the served copy is byte-identical to the stapled local dmg (not a stale leftover):
           # the two SHA-256s below must match before the clobber-upload.
           shasum -a 256 "$DMG" "${RUNNER_TEMP}/${STABLE_DMG}"
+          # AUTHORITATIVE SHIPPED-ARTIFACT GATE: stapling the .dmg CONTAINER is not enough — a browser
+          # download is quarantined, so the .app a user EXTRACTS and launches needs its OWN stapled
+          # ticket to clear Gatekeeper OFFLINE. Mount the exact bytes we are about to publish (this is
+          # the last writer of the asset) and fail closed if the inner .app is unstapled. Closes "green
+          # gate but the shipped .dmg's app is unstapled" (the 2026-06-20 class) on the real artifact,
+          # BEFORE the upload so a bad .dmg never goes live. (Confirmed against the real a2.1 .dmg: the
+          # .app sits at the volume root and `stapler validate` exits non-zero on an unstapled inner app.)
+          MNT="${RUNNER_TEMP}/dmg-verify"; mkdir -p "$MNT"
+          hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "${RUNNER_TEMP}/${STABLE_DMG}"
+          INNER_APP=$(find "$MNT" -maxdepth 1 -name '*.app' | head -1)
+          if [ -z "$INNER_APP" ]; then hdiutil detach "$MNT" >/dev/null 2>&1 || true; echo "::error::no .app found inside the published .dmg"; exit 1; fi
+          echo "validating stapled ticket on the .dmg's inner app: $INNER_APP"
+          if ! xcrun stapler validate "$INNER_APP"; then
+            hdiutil detach "$MNT" >/dev/null 2>&1 || true
+            echo "::error::the .app inside the published .dmg is NOT stapled — offline first-launch would fail Gatekeeper"; exit 1
+          fi
+          codesign --verify --deep --strict "$INNER_APP" \
+            || { hdiutil detach "$MNT" >/dev/null 2>&1 || true; echo "::error::the .app inside the published .dmg failed codesign --verify"; exit 1; }
+          hdiutil detach "$MNT" >/dev/null 2>&1 || true   # cleanup only — the gate above already decided
           gh release upload "$TAG" "${RUNNER_TEMP}/${STABLE_DMG}" --clobber -R "$GITHUB_REPOSITORY"
-          echo "notarized + stapled + re-uploaded ${STABLE_DMG}"
+          echo "notarized + stapled + inner-.app stapled-verified + re-uploaded ${STABLE_DMG}"
 
       # Phase 6a: prove every shipped asset is ANONYMOUSLY reachable (no Authorization header), so a
       # release can never publish while the repo/assets are unreachable to real users. Asserts the
