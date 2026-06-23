@@ -267,23 +267,61 @@ jobs:
           echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
 
       - name: Build the GitHub Release body from the marketing changelog
-        # Option 1: the public Release notes ARE the hand-authored CHANGELOG.md section — the same copy
-        # the web /offline/changelog page renders, so there's one source of truth and no second file.
-        # The source checkout is the workspace root, so the script + CHANGELOG.md are present; the
-        # extractor is pure-local (no network), so the egress block doesn't touch it. Prereleases aren't
-        # in the customer changelog, so they keep the generic body; a missing entry degrades gracefully.
+        # The public Release notes ARE the hand-authored CHANGELOG.md section — the same copy the web
+        # /offline/changelog page renders, so there's one source of truth and no second file. The
+        # PRIVATE source checkout owns the workspace root, so the extractor + CHANGELOG.md live there
+        # (same as resolve-release-channel.mjs above); it's pure-local, so the egress block never sees it.
+        #
+        # Three outcomes, kept deliberately distinct so a real tooling break can't hide as "no entry":
+        #   * prerelease (not in the customer changelog)        -> generic body
+        #   * full release whose version has no CHANGELOG entry -> generic body + ::warning::
+        #   * extractor missing / crashes / hits the network    -> FAIL the release (loud ::error::)
+        # Contract with scripts/extract-changelog-section.mjs: exit 0 + notes on stdout = found;
+        # exit 0 + empty (or whitespace-only) stdout = no entry (degrade); any non-zero exit = hard
+        # failure. The extractor logs its no-section note to STDERR, so we capture stdout only (no
+        # 2>&1) — that note must never leak into the published body. The body is
+        # normalized to a single trailing newline, so it is content-faithful to CHANGELOG.md (not
+        # necessarily byte-faithful in trailing whitespace). NOTE: the version handed to the extractor
+        # is steps.version.outputs.version; the published tag/title use tauri-action's own __VERSION__.
+        # The later "Assert release flag + assets match the gate" step fails the run if those diverge.
         id: relnotes
         env:
           VERSION: ${{ steps.version.outputs.version }}
           PRERELEASE: ${{ steps.version.outputs.prerelease }}
         run: |
-          if [ "$PRERELEASE" = "true" ]; then
-            printf 'body=See the assets to download and install this version.\n' >> "$GITHUB_OUTPUT"
-          elif NOTES="$(node scripts/extract-changelog-section.mjs "$VERSION")"; then
-            { printf 'body<<__EOF__\n'; printf '%s\n' "$NOTES"; printf '__EOF__\n'; } >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          GENERIC='See the assets to download and install this version.'
+          # Random delimiter: a fixed sentinel (e.g. __EOF__) appearing as a CHANGELOG line would
+          # otherwise close the GITHUB_OUTPUT value early and corrupt/truncate the published body.
+          DELIM="RELNOTES_EOF_$(openssl rand -hex 16)"
+
+          emit() {
+            { printf 'body<<%s\n' "$DELIM"; printf '%s\n' "$1"; printf '%s\n' "$DELIM"; } >> "$GITHUB_OUTPUT"
+          }
+
+          # Normalize (trim + lowercase) before the compare so a stray 'True'/' true ' still routes right.
+          case "$(printf '%s' "$PRERELEASE" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
+            true) emit "$GENERIC"; exit 0 ;;
+          esac
+
+          # A missing extractor is a misconfiguration (renamed script, wrong repo, bad path), NOT a
+          # "no entry" — fail loud rather than ship the generic body forever behind a benign warning.
+          if [ ! -f scripts/extract-changelog-section.mjs ]; then
+            echo "::error::scripts/extract-changelog-section.mjs not found in the source checkout"
+            exit 1
+          fi
+
+          if NOTES="$(node scripts/extract-changelog-section.mjs "$VERSION")"; then
+            if [ -n "$(printf '%s' "$NOTES" | tr -d '[:space:]')" ]; then
+              emit "$NOTES"
+            else
+              echo "::warning::no CHANGELOG.md entry for $VERSION — using the generic release body"
+              emit "$GENERIC"
+            fi
           else
-            echo "::warning::no CHANGELOG.md entry for $VERSION — using the generic release body"
-            printf 'body=See the assets to download and install this version.\n' >> "$GITHUB_OUTPUT"
+            echo "::error::extract-changelog-section.mjs failed for $VERSION — refusing to publish with an unverified body"
+            exit 1
           fi
 
       - name: Build and release
