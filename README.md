@@ -27,6 +27,17 @@ If `tauri-action` fails on a duplicate release, delete the broken GitHub Release
 
 Delete the releases-repo tag **locally and on origin**, then re-run `npm run release -- <ver>` from the source repo. The source tag can stay in place.
 
+### Release notes
+
+The published GitHub Release body is the hand-authored `CHANGELOG.md` section for that version — the same copy the web `/offline/changelog` page renders, so there's one source of truth. It's extracted at build time by `scripts/extract-changelog-section.mjs`, which (like `CHANGELOG.md`) lives in the **source** repo and is checked out at the release tag. The gate runs right after `npm ci`, before the build, so a misconfiguration fails cheap.
+
+Behavior by channel:
+
+- **Stable release** → the version's `CHANGELOG.md` section is published as the release body. Write that section in the source repo **before** cutting the tag.
+- **Prerelease** (including every `workflow_dispatch` run) → a generic body; prereleases aren't in the customer changelog.
+- **Stable release with no matching section** → generic body plus a loud CI warning. Abnormal — usually a tag pushed outside the normal `npm run release` cut. The release still ships (notes are cosmetic).
+- **Extractor missing, crashing, or attempting network** → the release **fails** before publishing. A broken release-notes tool blocks the release rather than silently shipping a generic body, so the failure is surfaced, not hidden.
+
 ### `workflow_dispatch` (prerelease only)
 
 Actions → **Release (TidyText Offline)** rebuilds from the source tag but **always publishes as prerelease**. Use for dry runs, not stable recovery. Version input is without the `v` prefix (e.g. `1.0.0`).
