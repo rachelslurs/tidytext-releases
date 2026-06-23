@@ -216,37 +216,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build frontend (TAURI=1)
-        run: npx cross-env TAURI=1 npm run build
-
-      - name: Verify offline bundle guards (release)
-        run: npm run check:tauri-bundle -- --release --outDir dist
-
-      # Belt-and-suspenders: the build we are about to SIGN must point its updater at THIS public
-      # repo. Catches a stale tauri.conf.json endpoint before a signed build bakes in a dead URL.
-      - name: Assert updater endpoint is pinned to the public releases repo
-        run: npm run check:updater-endpoint
-
-      # Backstops the zero-network guarantee: frontendDist points at the dist we just built TAURI=1,
-      # and beforeBuildCommand reuses it. If either drifts, a build could bundle telemetry while the
-      # dist-grep guards stay green.
-      - name: Assert offline build wiring is intact
-        run: |
-          node -e '
-            const c = require("./src-tauri/tauri.conf.json");
-            if (c.build.beforeBuildCommand !== "node scripts/build-for-tauri.cjs") {
-              console.error("::error::beforeBuildCommand changed — the TAURI=1 frontend guarantee is at risk");
-              process.exit(1);
-            }
-            if (c.build.frontendDist !== "../dist") {
-              console.error("::error::frontendDist no longer points at the built dist");
-              process.exit(1);
-            }
-          '
-
       # FAIL-CLOSED prerelease gate + version patch. Pure, unit-tested function (see the source repo's
       # src/__tests__/resolveReleaseChannel.test.ts). Reads github.ref — on a tag push that is THIS
-      # repo's tag (same shape as before), so the gate is unchanged.
+      # repo's tag (same shape as before), so the gate is unchanged. Resolved right after `npm ci`
+      # (same runtime as before, just earlier) so the changelog gate below can fail cheap.
       - name: Resolve version + release channel
         id: version
         env:
@@ -255,22 +228,12 @@ jobs:
           GIT_REF: ${{ github.ref }}
         run: node scripts/resolve-release-channel.mjs
 
-      - name: Decode App Store Connect API key
-        env:
-          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }} # Key ID — used only to name the file
-        run: |
-          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
-          printf '%s' "$APPLE_API_KEY_BASE64" | openssl base64 -d -A > "$KEY_PATH"
-          test -s "$KEY_PATH" || { echo "::error::decoded .p8 is empty — check the APPLE_API_KEY_BASE64 secret"; exit 1; }
-          grep -q 'BEGIN PRIVATE KEY' "$KEY_PATH" || { echo "::error::decoded .p8 is not a PEM key"; exit 1; }
-          echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
-
       - name: Build the GitHub Release body from the marketing changelog
         # The public Release notes ARE the hand-authored CHANGELOG.md section — the same copy the web
         # /offline/changelog page renders, so there's one source of truth and no second file. The
         # PRIVATE source checkout owns the workspace root, so the extractor + CHANGELOG.md live there
         # (same as resolve-release-channel.mjs above); it's pure-local, so the egress block never sees it.
+        # Positioned before the frontend build so a missing/crashing extractor fails cheap, not after it.
         #
         # Three outcomes, kept deliberately distinct so a real tooling break can't hide as "no entry":
         #   * prerelease (not in the customer changelog)        -> generic body
@@ -328,6 +291,45 @@ jobs:
             echo "::error::extract-changelog-section.mjs failed for $VERSION — refusing to publish with an unverified body"
             exit 1
           fi
+
+      - name: Build frontend (TAURI=1)
+        run: npx cross-env TAURI=1 npm run build
+
+      - name: Verify offline bundle guards (release)
+        run: npm run check:tauri-bundle -- --release --outDir dist
+
+      # Belt-and-suspenders: the build we are about to SIGN must point its updater at THIS public
+      # repo. Catches a stale tauri.conf.json endpoint before a signed build bakes in a dead URL.
+      - name: Assert updater endpoint is pinned to the public releases repo
+        run: npm run check:updater-endpoint
+
+      # Backstops the zero-network guarantee: frontendDist points at the dist we just built TAURI=1,
+      # and beforeBuildCommand reuses it. If either drifts, a build could bundle telemetry while the
+      # dist-grep guards stay green.
+      - name: Assert offline build wiring is intact
+        run: |
+          node -e '
+            const c = require("./src-tauri/tauri.conf.json");
+            if (c.build.beforeBuildCommand !== "node scripts/build-for-tauri.cjs") {
+              console.error("::error::beforeBuildCommand changed — the TAURI=1 frontend guarantee is at risk");
+              process.exit(1);
+            }
+            if (c.build.frontendDist !== "../dist") {
+              console.error("::error::frontendDist no longer points at the built dist");
+              process.exit(1);
+            }
+          '
+
+      - name: Decode App Store Connect API key
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }} # Key ID — used only to name the file
+        run: |
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_BASE64" | openssl base64 -d -A > "$KEY_PATH"
+          test -s "$KEY_PATH" || { echo "::error::decoded .p8 is empty — check the APPLE_API_KEY_BASE64 secret"; exit 1; }
+          grep -q 'BEGIN PRIVATE KEY' "$KEY_PATH" || { echo "::error::decoded .p8 is not a PEM key"; exit 1; }
+          echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
 
       - name: Build and release
         # Pinned (not @v0): this step mints signed updater manifests — a floating tag could change
