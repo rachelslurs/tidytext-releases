@@ -283,7 +283,9 @@ jobs:
         # normalized to a single trailing newline, so it is content-faithful to CHANGELOG.md (not
         # necessarily byte-faithful in trailing whitespace). NOTE: the version handed to the extractor
         # is steps.version.outputs.version; the published tag/title use tauri-action's own __VERSION__.
-        # The later "Assert release flag + assets match the gate" step fails the run if those diverge.
+        # These must stay in lockstep (source tag == tauri.conf.json version == resolver version). There's
+        # no explicit cross-check, but a divergence fails incidentally: the later "Assert release flag +
+        # assets" step looks up `gh release view v<version>`, which 404s if tauri published a different tag.
         id: relnotes
         env:
           VERSION: ${{ steps.version.outputs.version }}
