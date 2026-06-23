@@ -316,7 +316,10 @@ jobs:
             if [ -n "$(printf '%s' "$NOTES" | tr -d '[:space:]')" ]; then
               emit "$NOTES"
             else
-              echo "::warning::no CHANGELOG.md entry for $VERSION — using the generic release body"
+              # Prereleases are gated out above, so an empty result HERE is a full release with no
+              # CHANGELOG section — abnormal (a tag that bypassed the normal `npm run release` cut).
+              # Stay soft (notes are cosmetic; don't block a signed build), but make it loud.
+              echo "::warning title=Full release $VERSION has no CHANGELOG section::Shipping the generic release body. A full release should always carry a changelog section — confirm this tag came from the normal release cut and wasn't pushed manually."
               emit "$GENERIC"
             fi
           else
